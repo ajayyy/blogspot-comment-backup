@@ -5,10 +5,12 @@ from aiohttp import FormData
 sys.path.insert(0, './fetch/')
 
 from fetch.posts import get_blog_posts, MarkExclusion, NoEntries
-import downloader
+from downloader import PostsDownloader
 from batch_file import BatchFile
 
-MASTER_SERVER = "https://blogspot-comments-master.herokuapp.com"
+BATCH_DOWNLOADER_COUNT = 1
+
+MASTER_SERVER = "http://blogspot-comments-master.us.to"
 UPLOAD_SERVER = "http://blogstore.bot.nu"
 
 GET_ID_ENDPOINT = f"{MASTER_SERVER}/worker/getID"
@@ -25,7 +27,7 @@ SUBMIT_BATCH_UNIT = f"{UPLOAD_SERVER}/submitBatchUnit"
 # called by master
 # VERIFY_BATCH_UNIT = f"{UPLOAD_SERVER}/getVerifyBatchUnit"
 
-WORKER_VERSION = 1
+WORKER_VERSION = 2
 # WORKER_BATCH_SIZE = 500
 
 # Stop trying to connect to master after 18 hours
@@ -205,11 +207,17 @@ async def download_batch(worker_id, batch_id, batch_type, batch_content, random_
                     batch_file.end_blog()
                 # Other errors
                 elif blog_posts == "oe":
-                    print(f"Marking as exclusion: batch_id: {batch_id} | blog_name: {blog_name}")
-                    await submit_exclusion(worker_id, batch_id, random_key, blog_name, session)
-                    blog_domain = f"{blog_name}.blogspot.com"
-                    batch_file.start_blog(WORKER_VERSION, blog_name, blog_domain, "e", first_blog)
-                    batch_file.end_blog()
+                    if batch_type == "list":
+                        print(f"Marking as exclusion: batch_id: {batch_id} | blog_name: {blog_name}")
+                        await submit_exclusion(worker_id, batch_id, random_key, blog_name, session)
+                        blog_domain = f"{blog_name}.blogspot.com"
+                        batch_file.start_blog(WORKER_VERSION, blog_name, blog_domain, "e", first_blog)
+                        batch_file.end_blog()
+                    elif batch_type == "domain":
+                        print(f"Marking as investigate: batch_id: {batch_id} | blog_name: {blog_name}")
+                        blog_domain = f"{blog_name}.blogspot.com"
+                        batch_file.start_blog(WORKER_VERSION, blog_name, blog_domain, "__i", first_blog)
+                        batch_file.end_blog()
                 else:
                     blog_tld = tldextract.extract(blog_posts[0])
                     blog_domain = f"{blog_tld.domain}.{blog_tld.suffix}"
@@ -221,21 +229,27 @@ async def download_batch(worker_id, batch_id, batch_type, batch_content, random_
                         await submit_custom_domain(worker_id, batch_id, random_key, blog_name, blog_domain, session)
 
                     batch_file.start_blog(WORKER_VERSION, blog_name, blog_domain, "a", first_blog)
-                    await downloader.download_blog(blog_posts, batch_file, exclusion_limit)
+                    dler = PostsDownloader(blog_posts, batch_file, exclusion_limit)
+                    await dler.start()
                     batch_file.end_blog()
 
             except MarkExclusion:
-                print(f"Marking as exclusion: batch_id: {batch_id} | blog_name: {blog_name}")
-                await submit_exclusion(worker_id, batch_id, random_key, blog_name, session)
-                blog_domain = f"{blog_name}.blogspot.com"
-                batch_file.start_blog(WORKER_VERSION, blog_name, blog_domain, "e", first_blog)
-                batch_file.end_blog()
+                if batch_type == "list":
+                    print(f"Marking as exclusion: batch_id: {batch_id} | blog_name: {blog_name}")
+                    await submit_exclusion(worker_id, batch_id, random_key, blog_name, session)
+                    blog_domain = f"{blog_name}.blogspot.com"
+                    batch_file.start_blog(WORKER_VERSION, blog_name, blog_domain, "e", first_blog)
+                    batch_file.end_blog()
+                elif batch_type == "domain":
+                    print(f"Marking as investigate: batch_id: {batch_id} | blog_name: {blog_name}")
+                    blog_domain = f"{blog_name}.blogspot.com"
+                    batch_file.start_blog(WORKER_VERSION, blog_name, blog_domain, "__i", first_blog)
+                    batch_file.end_blog()
             except NoEntries:
                 print(f"Blog has no posts: batch_id: {batch_id} | blog_name: {blog_name}")
                 blog_domain = f"{blog_name}.blogspot.com"
                 batch_file.start_blog(WORKER_VERSION, blog_name, blog_domain, "a", first_blog)
                 batch_file.end_blog()
-
 
     if batch_type == "list":
         # batch_size = 5
@@ -267,6 +281,8 @@ async def download_batch(worker_id, batch_id, batch_type, batch_content, random_
     await update_batch_status(worker_id, batch_id, random_key, "c" if upload_response else "f", session)
     print(f"Deleting batch file | file_path: {file_path} | status: {upload_response}")
     os.remove(file_path)
+
+    return True
 
 async def retry_request_on_fail(func, fail_func, check_text, check_batch_fail=False, *args, **kwargs):
 
@@ -300,7 +316,7 @@ async def retry_request_on_fail(func, fail_func, check_text, check_batch_fail=Fa
             elif check_text:
                 text = await(response.text())
                 print(f"Server response: {text}")
-                if text != "Fail" or text == "Dupe" and response.status == 200:
+                if (text != "Fail" or text == "Dupe") and response.status == 200:
                     # print("Success!")
                     return response
                 else:
@@ -334,6 +350,56 @@ async def retry_request_on_fail(func, fail_func, check_text, check_batch_fail=Fa
     sys.exit(1)
     # return False
 
+async def download_domains():
+    async with aiohttp.ClientSession() as session:
+
+        def fail_func(response_status):
+            print(f"Failed to get domains.txt, retrying")
+
+        domains_response = await retry_request_on_fail(session.get, fail_func, False, False, "http://blogspot-comments-master.us.to/worker/domains.txt")
+
+        with open("../domains.txt", "wb") as domains:
+            while True:
+                # download in chunks of 10MB
+                chunk = await domains_response.content.read((1000 * 1000) * 10)
+                if not chunk:
+                    break
+                domains.write(chunk)
+
+async def batch_downloader(worker_id, domains, session, batch_id):
+    while True:
+        print("Requesting new batch...")
+        batch = await get_batch(worker_id, session)
+        # batch = {"batch_id": batch_id, "batch_type": "list", "random_key": 2938, "content": "", "batch_size": 250, "file_offset": 6161, "exclusion_limit": 450}
+        print(f"Received batch: {batch}")
+        if batch:
+            batch_id = batch["batch_id"]
+            batch_type = batch["batch_type"]
+            random_key = batch["random_key"]
+            batch_content = batch["content"]
+            batch_size = batch["batch_size"]
+            offset = int(batch["file_offset"])
+            exclusion_limit = int(batch["exclusion_limit"])
+
+            batch_result = None
+
+            for i in range(3):
+                try:
+                    batch_result = await download_batch(worker_id, batch_id, batch_type, batch_content, random_key, batch_size, offset, domains, exclusion_limit, session)
+                    break
+                except Exception as e:
+                    print(f"Error: {e}\nRetrying downloading of batch in 10 seconds: batch_id: {batch_id}")
+                    await asyncio.sleep(10)
+
+            if not batch_result:
+                print(f"Unable to download batch | batch_id: {batch_id}, requesting new batch in 10 seconds")
+
+        else:
+            print("Unable to get batch, requesting new batch in 10 seconds")
+
+        await asyncio.sleep(10)
+
+
 async def main():
 
     # logging.basicConfig(format="%(message)s", level=logging.INFO)
@@ -344,57 +410,14 @@ async def main():
             worker_id = await get_worker_id(session)
             # worker_id = "27747438-9825-51e1-9578-8807297944e6"
             if worker_id:
+                batch_downloader_tasks = []
                 print(f"Received worker ID: {worker_id}")
-                while True:
-                    print("Requesting new batch...")
-                    batch = await get_batch(worker_id, session)
-                    # batch = {"batch_id": 99, "batch_type": "domain", "random_key": 2938, "content": "0cal", "batch_size": 250, "file_offset": 2323, "exclusion_limit": 450}
-                    print(f"Received batch: {batch}")
-                    if batch:
-                        batch_id = batch["batch_id"]
-                        batch_type = batch["batch_type"]
-                        random_key = batch["random_key"]
-                        batch_content = batch["content"]
-                        batch_size = batch["batch_size"]
-                        offset = int(batch["file_offset"])
-                        exclusion_limit = int(batch["exclusion_limit"])
+                for i in range(BATCH_DOWNLOADER_COUNT):
+                    task = asyncio.create_task(batch_downloader(worker_id, domains, session, i))
+                    batch_downloader_tasks.append(task)
 
-                        for i in range(5):
-                            try:
-                                await download_batch(worker_id, batch_id, batch_type, batch_content, random_key, batch_size, offset, domains, exclusion_limit, session)
-                                break
-                            except (
-                                asyncio.TimeoutError, 
-                                aiohttp.client_exceptions.ServerDisconnectedError, 
-                                aiohttp.client_exceptions.ClientOSError,
-                                aiohttp.client_exceptions.ClientConnectorError
-                            ):
-                                print(f"Retrying downloading of batch in 10 seconds: batch_id: {batch_id}")
-                                await asyncio.sleep(10)
-
-                    else:
-                        print("Unable to get batch")
-
-                    await asyncio.sleep(10)
-
-    if downloader.session:
-        await downloader.session.close()
-
-async def download_domains():
-    async with aiohttp.ClientSession() as session:
-
-        def fail_func():
-            print(f"Failed to get domains.txt, retrying")
-
-        domains_response = await retry_request_on_fail(session.get, fail_func, False, False, "https://blogspot-comments-master.herokuapp.com/worker/domains.txt")
-
-        with open("../domains.txt", "wb") as domains:
-            while True:
-                # download in chunks of 10MB
-                chunk = await domains_response.content.read((1000 * 1000) * 10)
-                if not chunk:
-                    break
-                domains.write(chunk)
+                await asyncio.gather(*batch_downloader_tasks)
+                print("All batch downloaders done")
 
 if __name__ == '__main__':
     killer = GracefulKiller()
