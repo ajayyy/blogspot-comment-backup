@@ -10,7 +10,7 @@ from batch_file import BatchFile
 
 BATCH_DOWNLOADER_COUNT = 1
 
-MASTER_SERVER = "https://blogspot-comments-master.herokuapp.com"
+MASTER_SERVER = "http://blogspot-comments-master.us.to"
 UPLOAD_SERVER = "http://blogstore.bot.nu"
 
 GET_ID_ENDPOINT = f"{MASTER_SERVER}/worker/getID"
