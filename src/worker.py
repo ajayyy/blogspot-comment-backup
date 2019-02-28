@@ -353,7 +353,7 @@ async def retry_request_on_fail(func, fail_func, check_text, check_batch_fail=Fa
 async def download_domains():
     async with aiohttp.ClientSession() as session:
 
-        def fail_func():
+        def fail_func(response_status):
             print(f"Failed to get domains.txt, retrying")
 
         domains_response = await retry_request_on_fail(session.get, fail_func, False, False, "http://blogspot-comments-master.us.to/worker/domains.txt")
