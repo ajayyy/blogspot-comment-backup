@@ -356,7 +356,7 @@ async def download_domains():
         def fail_func():
             print(f"Failed to get domains.txt, retrying")
 
-        domains_response = await retry_request_on_fail(session.get, fail_func, False, False, "https://blogspot-comments-master.herokuapp.com/worker/domains.txt")
+        domains_response = await retry_request_on_fail(session.get, fail_func, False, False, "http://blogspot-comments-master.us.to/worker/domains.txt")
 
         with open("../domains.txt", "wb") as domains:
             while True:
